@@ -95,44 +95,49 @@ async function main() {
   });
 
   deck.setBrightness(80);
-  // Tune for animation speed — small ZIPs (1-2 buttons) process fast
-  deck.postTransferDelayMs = 5;
+  // Tune for animation — give the device a bit of breathing room to
+  // avoid blinking between frames
+  deck.postTransferDelayMs = 30;
   deck.batchDelayMs = 5;
 
-  // Rainbow animation on button 0
-  console.log('Generating 24 rainbow frames...');
-  const rainbowFrames = await generateRainbowFrames(24);
+  // Generate rainbow frames shared by all buttons
+  const frameCount = 24;
+  console.log(`Generating ${frameCount} rainbow frames...`);
+  const rainbowFrames = await generateRainbowFrames(frameCount);
   console.log(`Rainbow: ${rainbowFrames.length} frames, first=${rainbowFrames[0].length} bytes`);
 
-  console.log('Starting rainbow animation on button 0 at 15 FPS...');
-  await deck.animateButton(0, rainbowFrames, 15);
-  console.log('Rainbow animation started (loop running in background)');
-
-  // GIF
+  // If a GIF is provided, use it instead of rainbow for all buttons
+  let animFrames = rainbowFrames;
   const gifArg = process.argv[2];
   if (gifArg) {
     const gifPath = path.resolve(gifArg);
     if (fs.existsSync(gifPath)) {
       console.log(`Loading GIF: ${gifPath}`);
-      const gifFrames = await extractGifFrames(gifPath);
-      console.log(`GIF: ${gifFrames.length} frames. Starting animation on button 1...`);
-      await deck.animateButton(1, gifFrames, 15);
-      console.log('GIF animation started');
+      animFrames = await extractGifFrames(gifPath);
+      console.log(`GIF: ${animFrames.length} frames`);
     } else {
       console.error(`GIF file not found: ${gifPath}`);
     }
   }
 
+  // Animate ALL 13 buttons with staggered start frames
+  console.log('Starting animation on all 13 buttons (staggered)...');
+  const stagger = Math.max(1, Math.floor(animFrames.length / 13));
+  for (let i = 0; i < 13; i++) {
+    // Offset the frames so each button starts at a different point
+    const offset = (i * stagger) % animFrames.length;
+    const shifted = [...animFrames.slice(offset), ...animFrames.slice(0, offset)];
+    await deck.animateButton(i, shifted, 10);
+  }
+  console.log('All 13 buttons animating!');
+
   deck.startPolling();
   deck.on('press', (index) => {
-    console.log(`Button ${index} pressed`);
-    if (index === 0) {
-      console.log('Stopping rainbow animation');
-      deck.stopAnimation(0);
-    }
+    console.log(`Button ${index} pressed — stopping its animation`);
+    deck.stopAnimation(index);
   });
 
-  console.log('Press button 0 to stop rainbow. Ctrl+C to exit.\n');
+  console.log('Press any button to stop its animation. Ctrl+C to exit.\n');
 }
 
 main().catch((err) => {

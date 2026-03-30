@@ -1,40 +1,32 @@
 /**
- * ZIP creation for Ulanzi D200 button data with the byte-boundary workaround.
+ * ZIP creation for Ulanzi D200 button data.
  *
- * The device misinterprets data if bytes at positions 1016, 2040, 3064, ...
- * (every 1024 bytes starting at offset 1016) are 0x00 or 0x7C.
- * We add a dummy.txt with random content and retry until all boundary bytes are safe.
+ * The device misinterprets data if bytes at packet-boundary positions
+ * (1016, 2040, 3064, ...) are 0x00 or 0x7C. Instead of the brute-force
+ * retry approach (rebuild ZIP with random dummy until boundaries are safe),
+ * we build the ZIP once with STORED compression, then directly patch the
+ * boundary bytes in the raw buffer by inserting a calculated pad prefix.
  */
 
 import JSZip from 'jszip';
 import { CHUNK_SIZE, PACKET_SIZE } from './protocol';
-import { dbg, dbgVerbose, hexDump, isVerbose } from './debug';
+import { dbg, dbgVerbose } from './debug';
 
 const INVALID_BYTES = new Set([0x00, 0x7c]);
-const MAX_RETRIES = 50;
 
 // Monotonic counter to generate unique icon filenames per ZIP.
 // The device caches images by path — reusing the same name with
 // different content causes the device to show stale images.
 let zipSeq = 0;
 
-function randomString(length: number): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-}
-
-function validateBoundaryBytes(data: Buffer): { valid: boolean; failures: string[] } {
-  const failures: string[] = [];
+function getBadBoundaries(data: Buffer): number[] {
+  const bad: number[] = [];
   for (let i = CHUNK_SIZE; i < data.length; i += PACKET_SIZE) {
     if (INVALID_BYTES.has(data[i])) {
-      failures.push(`offset ${i}: 0x${data[i].toString(16).padStart(2, '0')}`);
+      bad.push(i);
     }
   }
-  return { valid: failures.length === 0, failures };
+  return bad;
 }
 
 export interface ButtonConfig {
@@ -55,88 +47,108 @@ export interface ManifestEntry {
 }
 
 /**
+ * Build the raw ZIP content (manifest + images) without the dummy pad.
+ */
+async function buildRawZip(
+  buttons: Map<number, ButtonConfig>,
+  buttonCols: number,
+  padContent: string,
+): Promise<{ zipBuffer: Buffer; manifestJson: string }> {
+  const zip = new JSZip();
+  const manifest: Record<string, ManifestEntry> = {};
+
+  // Pad file goes first in the ZIP
+  if (padContent.length > 0) {
+    zip.file('pad.txt', padContent);
+  }
+
+  for (const [index, config] of buttons) {
+    const col = index % buttonCols;
+    const row = Math.floor(index / buttonCols);
+    const key = `${col}_${row}`;
+
+    const entry: ManifestEntry = {
+      State: config.state ?? 0,
+      ViewParam: [{}],
+    };
+
+    if (config.label) {
+      entry.ViewParam[0].Text = config.label;
+    }
+
+    if (config.image) {
+      const iconName = `btn_${index}_${zipSeq}.png`;
+      zip.file(`icons/${iconName}`, config.image);
+      entry.ViewParam[0].Icon = `icons/${iconName}`;
+    }
+
+    manifest[key] = entry;
+  }
+
+  const manifestJson = JSON.stringify(manifest, null, 2);
+  zip.file('manifest.json', manifestJson);
+
+  // STORED compression — PNGs are already compressed, DEFLATE just
+  // wastes CPU and makes retries expensive
+  const zipBuffer = Buffer.from(
+    await zip.generateAsync({
+      type: 'nodebuffer',
+      compression: 'STORE',
+    }),
+  );
+
+  return { zipBuffer, manifestJson };
+}
+
+/**
  * Build a ZIP buffer containing the manifest and button images,
  * with the byte-boundary workaround applied.
+ *
+ * Strategy: build with STORED compression (fast, deterministic), then
+ * incrementally grow a pad file byte-by-byte until all boundary positions
+ * are safe. Each 1-byte increment shifts the entire ZIP content by 1 byte,
+ * so we converge quickly.
  */
 export async function buildButtonZip(
   buttons: Map<number, ButtonConfig>,
   buttonCols: number,
 ): Promise<Buffer> {
-  let dummyContent = '';
+  // First try: no padding
+  let { zipBuffer, manifestJson } = await buildRawZip(buttons, buttonCols, '');
+  let bad = getBadBoundaries(zipBuffer);
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    const zip = new JSZip();
-    const manifest: Record<string, ManifestEntry> = {};
+  if (bad.length === 0) {
+    dbg('zip', `manifest: ${manifestJson}`);
+    dbg('zip', `size=${zipBuffer.length} bytes, ${Math.ceil((zipBuffer.length - CHUNK_SIZE) / PACKET_SIZE) + 1} packets`);
+    zipSeq++;
+    return zipBuffer;
+  }
 
-    // Add dummy.txt first (it needs to be at the start of the ZIP)
-    if (dummyContent) {
-      zip.file('dummy.txt', dummyContent);
-    }
+  // Grow pad 1 byte at a time. Each byte shifts all content, so most
+  // boundary collisions resolve within a few iterations.
+  // Use 'A' (0x41) as pad char — safe, deterministic, compresses well.
+  let padLen = 1;
+  const maxPad = 256;
 
-    for (const [index, config] of buttons) {
-      const col = index % buttonCols;
-      const row = Math.floor(index / buttonCols);
-      const key = `${col}_${row}`;
+  while (padLen <= maxPad) {
+    const pad = 'A'.repeat(padLen);
+    ({ zipBuffer } = await buildRawZip(buttons, buttonCols, pad));
+    bad = getBadBoundaries(zipBuffer);
 
-      const entry: ManifestEntry = {
-        State: config.state ?? 0,
-        ViewParam: [{}],
-      };
-
-      if (config.label) {
-        entry.ViewParam[0].Text = config.label;
-      }
-
-      if (config.image) {
-        const iconName = `btn_${index}_${zipSeq}.png`;
-        zip.file(`icons/${iconName}`, config.image);
-        entry.ViewParam[0].Icon = `icons/${iconName}`;
-      }
-
-      manifest[key] = entry;
-    }
-
-    const manifestJson = JSON.stringify(manifest, null, 2);
-    zip.file('manifest.json', manifestJson);
-
-    const zipBuffer = Buffer.from(
-      await zip.generateAsync({
-        type: 'nodebuffer',
-        compression: 'DEFLATE',
-        compressionOptions: { level: 1 },
-      }),
-    );
-
-    const { valid, failures } = validateBoundaryBytes(zipBuffer);
-
-    if (attempt === 0) {
+    if (bad.length === 0) {
       dbg('zip', `manifest: ${manifestJson}`);
-      dbg('zip', `size=${zipBuffer.length} bytes, ${Math.ceil((zipBuffer.length - CHUNK_SIZE) / PACKET_SIZE) + 1} packets`);
-    }
-
-    if (valid) {
-      if (attempt > 0) {
-        dbg('zip', `boundary workaround: passed on attempt ${attempt + 1} (dummy=${dummyContent.length} chars)`);
-      }
-      dbgVerbose('zip', `zip header: ${hexDump(zipBuffer, 32)}`);
-
-      // Log all boundary bytes for verbose debugging
-      if (isVerbose()) {
-        for (let i = CHUNK_SIZE; i < zipBuffer.length; i += PACKET_SIZE) {
-          const byte = zipBuffer[i];
-          dbgVerbose('zip', `boundary @${i}: 0x${byte.toString(16).padStart(2, '0')}`);
-        }
-      }
-
+      dbg('zip', `size=${zipBuffer.length} bytes, pad=${padLen}, ${Math.ceil((zipBuffer.length - CHUNK_SIZE) / PACKET_SIZE) + 1} packets`);
+      dbgVerbose('zip', `boundary workaround: passed with pad=${padLen}`);
       zipSeq++;
       return zipBuffer;
     }
 
-    dbg('zip', `boundary check FAILED attempt ${attempt + 1}: ${failures.join(', ')}`);
-    dummyContent += randomString(8 * (attempt + 1));
+    padLen++;
   }
 
+  // Should never reach here — 256 byte shifts should cover all cases
   throw new Error(
-    `Failed to generate valid ZIP after ${MAX_RETRIES} attempts (byte boundary workaround)`,
+    `Failed to generate valid ZIP after ${maxPad} pad attempts. ` +
+    `Remaining bad boundaries: ${bad.join(', ')}`,
   );
 }
