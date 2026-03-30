@@ -290,7 +290,14 @@ export class UlanziD200 extends EventEmitter {
    * Start a clock on the info window that auto-updates every second.
    * Returns a stop function.
    */
-  startClock(): { stop: () => void } {
+  async startClock(): Promise<{ stop: () => void }> {
+    // Set a black background on button 13 to clear the Ulanzi logo
+    const black = Buffer.from(
+      '<svg width="196" height="196" xmlns="http://www.w3.org/2000/svg">' +
+      '<rect width="196" height="196" fill="black"/></svg>',
+    );
+    await this.setButton(13, { image: black });
+
     this.setSmallWindow({ mode: SmallWindowMode.CLOCK });
     const timer = setInterval(() => {
       this.setSmallWindow({ mode: SmallWindowMode.CLOCK });

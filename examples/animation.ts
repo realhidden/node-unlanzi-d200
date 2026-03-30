@@ -100,8 +100,8 @@ async function main() {
   deck.batchDelayMs = 5;
   deck.useStoredCompression = true;
 
-  // Start a clock on the info window (button 13)
-  const clock = deck.startClock();
+  // Start a clock on the info window (button 13) — clears the logo first
+  const clock = await deck.startClock();
 
   // Generate rainbow frames shared by all buttons
   const frameCount = 24;
