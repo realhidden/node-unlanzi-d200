@@ -80,6 +80,13 @@ export class UlanziD200 extends EventEmitter {
   batchDelayMs = 16;
   /** Use STORED compression (faster builds, larger ZIPs). Enable for animation. */
   useStoredCompression = false;
+  /**
+   * Treat the info window (button 13) as a normal button.
+   * When true, taps on the info window emit 'press'/'release' events
+   * like any other button. When false (default), button 13 events are
+   * filtered as periodic status updates and only emit 'info-window'.
+   */
+  infoWindowAsButton = false;
 
   private device: HID.HID;
   private polling = false;
@@ -199,10 +206,9 @@ export class UlanziD200 extends EventEmitter {
         case InCommand.BUTTON_2: {
           const press = parseButtonPress(parsed.data);
           if (press) {
-            // Button 13 is the info window — it sends periodic status
-            // updates (~8/sec) that are NOT real button presses.
-            // Filter them out to avoid flooding the render loop.
-            if (press.index === 13) {
+            // Button 13 is the info window. It sends periodic status
+            // updates (~8/sec) alongside real tap events.
+            if (press.index === 13 && !this.infoWindowAsButton) {
               dbgVerbose('recv', `info-window mode=${press.state}`);
               this.emit('info-window', { mode: press.state });
               break;
