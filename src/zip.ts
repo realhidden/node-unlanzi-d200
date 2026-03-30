@@ -44,6 +44,8 @@ export interface ButtonConfig {
   label?: string;
   /** PNG image data as Buffer */
   image?: Buffer;
+  /** Reference to a preloaded image by name (from preloadImages) */
+  iconRef?: string;
   /** State value (default: 0) */
   state?: number;
 }
@@ -54,6 +56,66 @@ export interface ManifestEntry {
     Text?: string;
     Icon?: string;
   }>;
+}
+
+/**
+ * Build a preload ZIP containing named images for the device cache.
+ * The manifest maps all images to button 0 — the layout doesn't matter,
+ * we just need the device to ingest and cache the image files.
+ */
+export async function buildPreloadZip(
+  images: Map<string, Buffer>,
+  useStored: boolean,
+): Promise<Buffer> {
+  // We need a valid manifest or the device ignores the ZIP.
+  // Map all images to button 0_0 in a single ViewParam array —
+  // the actual layout will be set later by setLayout.
+  const manifest: Record<string, ManifestEntry> = {
+    '0_0': {
+      State: 0,
+      ViewParam: [{}],
+    },
+  };
+
+  let padContent = '';
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const zip = new JSZip();
+
+    if (padContent.length > 0) {
+      zip.file('pad.txt', padContent);
+    }
+
+    for (const [name, data] of images) {
+      zip.file(`icons/${name}`, data);
+    }
+
+    // Set the first image as the icon so the manifest is valid
+    const firstName = images.keys().next().value;
+    if (firstName) {
+      manifest['0_0'].ViewParam[0].Icon = `icons/${firstName}`;
+    }
+    zip.file('manifest.json', JSON.stringify(manifest, null, 2));
+
+    const zipBuffer = Buffer.from(
+      await zip.generateAsync({
+        type: 'nodebuffer',
+        compression: useStored ? 'STORE' : 'DEFLATE',
+        compressionOptions: useStored ? undefined : { level: 1 },
+      }),
+    );
+
+    const bad = getBadBoundaries(zipBuffer);
+    if (bad.length === 0) {
+      dbg('zip', `preload: ${images.size} images, ${zipBuffer.length} bytes`);
+      return zipBuffer;
+    }
+
+    padContent = useStored
+      ? 'A'.repeat(attempt + 1)
+      : randomString(8 * (attempt + 1));
+  }
+
+  throw new Error(`Failed to build preload ZIP after ${MAX_RETRIES} attempts`);
 }
 
 /**
@@ -87,7 +149,10 @@ async function buildRawZip(
       entry.ViewParam[0].Text = config.label;
     }
 
-    if (config.image) {
+    if (config.iconRef) {
+      // Reference a preloaded/cached image by path — no image data in ZIP
+      entry.ViewParam[0].Icon = config.iconRef;
+    } else if (config.image) {
       const iconName = `btn_${index}_${zipSeq}.png`;
       zip.file(`icons/${iconName}`, config.image);
       entry.ViewParam[0].Icon = `icons/${iconName}`;
