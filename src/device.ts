@@ -194,7 +194,8 @@ export class UlanziD200 extends EventEmitter {
 
       switch (parsed.command) {
         case InCommand.BUTTON:
-        case InCommand.BUTTON_2: {
+        case InCommand.BUTTON_2:
+        case InCommand.BUTTON_3: {
           const press = parseButtonPress(parsed.data);
           if (press) {
             // Button 13 is the info window — it sends continuous status
