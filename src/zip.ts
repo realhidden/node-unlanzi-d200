@@ -13,6 +13,16 @@ import { CHUNK_SIZE, PACKET_SIZE } from './protocol';
 import { dbg, dbgVerbose } from './debug';
 
 const INVALID_BYTES = new Set([0x00, 0x7c]);
+const MAX_RETRIES = 100;
+
+function randomString(length: number): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
 
 // Monotonic counter to generate unique icon filenames per ZIP.
 // The device caches images by path — reusing the same name with
@@ -125,31 +135,30 @@ export async function buildButtonZip(
     return zipBuffer;
   }
 
-  // Grow pad 1 byte at a time. Each byte shifts all content, so most
-  // boundary collisions resolve within a few iterations.
-  // Use 'A' (0x41) as pad char — safe, deterministic, compresses well.
-  let padLen = 1;
-  const maxPad = 256;
+  // Strategy depends on compression mode:
+  // - STORED: deterministic 1-byte increments (each byte shifts content by exactly 1)
+  // - DEFLATE: random padding (compressed output is unpredictable, so we randomize)
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const pad = useStored
+      ? 'A'.repeat(attempt)
+      : randomString(8 * attempt);
 
-  while (padLen <= maxPad) {
-    const pad = 'A'.repeat(padLen);
     ({ zipBuffer } = await buildRawZip(buttons, buttonCols, pad, useStored));
     bad = getBadBoundaries(zipBuffer);
 
     if (bad.length === 0) {
       dbg('zip', `manifest: ${manifestJson}`);
-      dbg('zip', `size=${zipBuffer.length} bytes, pad=${padLen}, ${Math.ceil((zipBuffer.length - CHUNK_SIZE) / PACKET_SIZE) + 1} packets`);
-      dbgVerbose('zip', `boundary workaround: passed with pad=${padLen}`);
+      dbg('zip', `size=${zipBuffer.length} bytes, pad=${pad.length}, ${Math.ceil((zipBuffer.length - CHUNK_SIZE) / PACKET_SIZE) + 1} packets`);
+      if (attempt > 2) {
+        dbg('zip', `boundary workaround: passed on attempt ${attempt + 1}`);
+      }
       zipSeq++;
       return zipBuffer;
     }
-
-    padLen++;
   }
 
-  // Should never reach here — 256 byte shifts should cover all cases
   throw new Error(
-    `Failed to generate valid ZIP after ${maxPad} pad attempts. ` +
+    `Failed to generate valid ZIP after ${MAX_RETRIES} pad attempts. ` +
     `Remaining bad boundaries: ${bad.join(', ')}`,
   );
 }
