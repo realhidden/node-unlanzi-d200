@@ -1,0 +1,36 @@
+{
+  "name": "ulanzi-d200",
+  "version": "0.1.0",
+  "description": "Node.js library for the Ulanzi D200 USB LCD key controller",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "example": "ts-node examples/demo.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ulanzi",
+    "d200",
+    "stream-deck",
+    "macro-pad",
+    "lcd-keys",
+    "hid",
+    "usb"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "node-hid": "^3.1.0",
+    "jszip": "^3.10.1",
+    "sharp": "^0.33.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0",
+    "ts-node": "^10.9.2"
+  }
+}
