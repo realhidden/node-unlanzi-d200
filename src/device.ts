@@ -15,7 +15,7 @@ import {
   parseDeviceInfo,
   ButtonPressData,
 } from './protocol';
-import { buildButtonZip, buildPreloadZip, ButtonConfig } from './zip';
+import { buildButtonZip, buildPreloadZips, ButtonConfig } from './zip';
 import { dbg, dbgVerbose, hexDump, setDebugLevel, setDebugLogFile, type DebugLevel } from './debug';
 
 export { setDebugLevel, setDebugLogFile, DebugLevel };
@@ -372,10 +372,20 @@ export class UlanziD200 extends EventEmitter {
       this.preloadedNames.add(name);
     }
 
+    // Build batched ZIPs — each batch maps up to 13 images to real
+    // button positions so the device renders and caches them.
     dbg('cache', `preloading ${prepared.size} images`);
-    const zipData = await buildPreloadZip(prepared, this.useStoredCompression);
-    const packets = buildFileTransferPackets(OutCommand.SET_BUTTONS, zipData);
-    await this.enqueueWrite('PRELOAD', () => this.writeFileTransfer(packets, 'PRELOAD'));
+    const zips = await buildPreloadZips(prepared, UlanziD200.BUTTON_COLS, this.useStoredCompression);
+
+    for (let i = 0; i < zips.length; i++) {
+      dbg('cache', `sending preload batch ${i + 1}/${zips.length}`);
+      const packets = buildFileTransferPackets(OutCommand.SET_BUTTONS, zips[i]);
+      await this.enqueueWrite(`PRELOAD_${i + 1}`, () => this.writeFileTransfer(packets, `PRELOAD_${i + 1}`));
+      // Extra delay between batches to let the device fully process each one
+      await sleep(200);
+    }
+
+    dbg('cache', `preload complete — ${prepared.size} images cached`);
   }
 
   /**
