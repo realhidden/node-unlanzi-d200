@@ -95,10 +95,10 @@ async function main() {
   });
 
   deck.setBrightness(80);
-  // Tune for animation — give the device a bit of breathing room to
-  // avoid blinking between frames
+  // Tune for animation performance
   deck.postTransferDelayMs = 30;
   deck.batchDelayMs = 5;
+  deck.useStoredCompression = true; // faster ZIP builds for animation
 
   // Generate rainbow frames shared by all buttons
   const frameCount = 24;

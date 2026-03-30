@@ -78,6 +78,8 @@ export class UlanziD200 extends EventEmitter {
   postTransferDelayMs = 100;
   /** How long to wait (ms) for more changes before flushing a batched update */
   batchDelayMs = 16;
+  /** Use STORED compression (faster builds, larger ZIPs). Enable for animation. */
+  useStoredCompression = false;
 
   private device: HID.HID;
   private polling = false;
@@ -448,7 +450,7 @@ export class UlanziD200 extends EventEmitter {
 
     // Snapshot state so async ZIP build isn't affected by concurrent changes
     const snapshot = new Map(this.buttonState);
-    const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS);
+    const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS, this.useStoredCompression);
     const packets = buildFileTransferPackets(OutCommand.SET_BUTTONS, zipData);
     await this.enqueueWrite('SET_BUTTONS', () => this.writeFileTransfer(packets, 'SET_BUTTONS'));
   }
@@ -498,7 +500,7 @@ export class UlanziD200 extends EventEmitter {
         const indices = [...snapshot.keys()].sort((a, b) => a - b);
         dbg('render', `SET_BUTTONS [${indices.join(',')}] (${snapshot.size} buttons)`);
 
-        const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS);
+        const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS, this.useStoredCompression);
         const packets = buildFileTransferPackets(OutCommand.SET_BUTTONS, zipData);
 
         await this.enqueueWrite('SET_BUTTONS', () =>

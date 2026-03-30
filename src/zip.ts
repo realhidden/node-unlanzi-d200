@@ -53,6 +53,7 @@ async function buildRawZip(
   buttons: Map<number, ButtonConfig>,
   buttonCols: number,
   padContent: string,
+  useStored: boolean,
 ): Promise<{ zipBuffer: Buffer; manifestJson: string }> {
   const zip = new JSZip();
   const manifest: Record<string, ManifestEntry> = {};
@@ -88,12 +89,11 @@ async function buildRawZip(
   const manifestJson = JSON.stringify(manifest, null, 2);
   zip.file('manifest.json', manifestJson);
 
-  // STORED compression — PNGs are already compressed, DEFLATE just
-  // wastes CPU and makes retries expensive
   const zipBuffer = Buffer.from(
     await zip.generateAsync({
       type: 'nodebuffer',
-      compression: 'STORE',
+      compression: useStored ? 'STORE' : 'DEFLATE',
+      compressionOptions: useStored ? undefined : { level: 1 },
     }),
   );
 
@@ -112,9 +112,10 @@ async function buildRawZip(
 export async function buildButtonZip(
   buttons: Map<number, ButtonConfig>,
   buttonCols: number,
+  useStored = false,
 ): Promise<Buffer> {
   // First try: no padding
-  let { zipBuffer, manifestJson } = await buildRawZip(buttons, buttonCols, '');
+  let { zipBuffer, manifestJson } = await buildRawZip(buttons, buttonCols, '', useStored);
   let bad = getBadBoundaries(zipBuffer);
 
   if (bad.length === 0) {
@@ -132,7 +133,7 @@ export async function buildButtonZip(
 
   while (padLen <= maxPad) {
     const pad = 'A'.repeat(padLen);
-    ({ zipBuffer } = await buildRawZip(buttons, buttonCols, pad));
+    ({ zipBuffer } = await buildRawZip(buttons, buttonCols, pad, useStored));
     bad = getBadBoundaries(zipBuffer);
 
     if (bad.length === 0) {
