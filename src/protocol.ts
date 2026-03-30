@@ -22,7 +22,9 @@ export enum OutCommand {
   SET_SMALL_WINDOW_DATA = 0x0006,
   SET_BRIGHTNESS = 0x000a,
   SET_LABEL_STYLE = 0x000b,
-  PARTIALLY_UPDATE_BUTTONS = 0x000d,
+  // 0x000d PARTIALLY_UPDATE_BUTTONS exists in the protocol but is
+  // unreliable in the device firmware — causes ghost/white buttons.
+  // We always use SET_BUTTONS with full state instead.
 }
 
 export const OutCommandName: Record<number, string> = {
@@ -30,7 +32,6 @@ export const OutCommandName: Record<number, string> = {
   [OutCommand.SET_SMALL_WINDOW_DATA]: 'SET_SMALL_WINDOW_DATA',
   [OutCommand.SET_BRIGHTNESS]: 'SET_BRIGHTNESS',
   [OutCommand.SET_LABEL_STYLE]: 'SET_LABEL_STYLE',
-  [OutCommand.PARTIALLY_UPDATE_BUTTONS]: 'PARTIALLY_UPDATE_BUTTONS',
 };
 
 /** Commands received from device */

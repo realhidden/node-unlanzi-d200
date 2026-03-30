@@ -88,9 +88,8 @@ export class UlanziD200 extends EventEmitter {
   private writeQueue: Promise<void> = Promise.resolve();
   private writeSeq = 0;
 
-  // Internal button state — always send full SET_BUTTONS with all 13 buttons.
-  // Render loop: only one render cycle runs at a time. Changes arriving
-  // during a transfer are absorbed and sent in the next cycle.
+  // Internal button state. Render loop: only one render cycle runs at a
+  // time. Changes arriving during a transfer are absorbed into the next cycle.
   private buttonState = new Map<number, ButtonConfig>();
   private dirty = false;
   private rendering = false;
@@ -449,8 +448,8 @@ export class UlanziD200 extends EventEmitter {
 
   /**
    * Render loop — keeps running as long as the state is dirty.
-   * Snapshots the state, builds a ZIP, sends it, then checks
-   * if more changes arrived during the transfer.
+   * Always sends full SET_BUTTONS with all buttons.
+   * (PARTIALLY_UPDATE_BUTTONS is unreliable in the device firmware.)
    */
   private async renderLoop(): Promise<void> {
     this.rendering = true;
@@ -461,9 +460,6 @@ export class UlanziD200 extends EventEmitter {
 
         // Small delay to batch changes from the same event cascade
         await sleep(this.batchDelayMs);
-
-        // Clear dirty — changes during the sleep are captured in our
-        // snapshot below. New changes AFTER the snapshot set dirty again.
         this.dirty = false;
 
         if (this.buttonState.size === 0) {
@@ -471,8 +467,6 @@ export class UlanziD200 extends EventEmitter {
           continue;
         }
 
-        // Snapshot state so concurrent setButton calls during the async
-        // ZIP build don't corrupt the data
         const snapshot = new Map(this.buttonState);
         const indices = [...snapshot.keys()].sort((a, b) => a - b);
         dbg('render', `SET_BUTTONS [${indices.join(',')}] (${snapshot.size} buttons)`);
@@ -480,11 +474,12 @@ export class UlanziD200 extends EventEmitter {
         const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS);
         const packets = buildFileTransferPackets(OutCommand.SET_BUTTONS, zipData);
 
-        await this.enqueueWrite('SET_BUTTONS', () => this.writeFileTransfer(packets, 'SET_BUTTONS'));
+        await this.enqueueWrite('SET_BUTTONS', () =>
+          this.writeFileTransfer(packets, 'SET_BUTTONS'),
+        );
       }
     } finally {
       this.rendering = false;
-      // Resolve all waiters — their changes were included
       const waiters = this.renderWaiters;
       this.renderWaiters = [];
       for (const r of waiters) r();
