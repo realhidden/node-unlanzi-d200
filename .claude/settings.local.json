@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:hackaday.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:community.home-assistant.io)",
+      "Bash(gh api:*)",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(f{d[''''type'''']:10s} {d[''''path'''']}\\) for d in data]\")",
+      "Bash(python3 -c \"import json,sys,base64; data=json.load\\(sys.stdin\\); print\\(base64.b64decode\\(data[''''content'''']\\).decode\\(\\)\\)\")",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:community.folivora.ai)",
+      "Bash(curl:*)",
+      "Bash(git init:*)",
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(npx ts-node:*)",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"ts-node.*animation\")",
+      "Bash(pkill:*)",
+      "Bash(git revert:*)"
+    ]
+  }
+}

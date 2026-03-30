@@ -44,8 +44,6 @@ export interface ButtonConfig {
   label?: string;
   /** PNG image data as Buffer */
   image?: Buffer;
-  /** Reference to a preloaded image by name (from preloadImages) */
-  iconRef?: string;
   /** State value (default: 0) */
   state?: number;
 }
@@ -56,79 +54,6 @@ export interface ManifestEntry {
     Text?: string;
     Icon?: string;
   }>;
-}
-
-/**
- * Build preload ZIPs that map images to real button positions so the
- * device actually renders and caches them. Returns multiple ZIPs if
- * there are more images than button slots (13).
- */
-export async function buildPreloadZips(
-  images: Map<string, Buffer>,
-  buttonCols: number,
-  useStored: boolean,
-): Promise<Buffer[]> {
-  const names = [...images.keys()];
-  const zips: Buffer[] = [];
-  const BUTTONS_PER_BATCH = 13;
-
-  for (let batchStart = 0; batchStart < names.length; batchStart += BUTTONS_PER_BATCH) {
-    const batchNames = names.slice(batchStart, batchStart + BUTTONS_PER_BATCH);
-
-    let padContent = '';
-    let built = false;
-
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      const zip = new JSZip();
-      const manifest: Record<string, ManifestEntry> = {};
-
-      if (padContent.length > 0) {
-        zip.file('pad.txt', padContent);
-      }
-
-      // Map each image to a real button position so the device renders it
-      for (let i = 0; i < batchNames.length; i++) {
-        const name = batchNames[i];
-        const col = i % buttonCols;
-        const row = Math.floor(i / buttonCols);
-        const key = `${col}_${row}`;
-
-        zip.file(`icons/${name}`, images.get(name)!);
-        manifest[key] = {
-          State: 0,
-          ViewParam: [{ Icon: `icons/${name}` }],
-        };
-      }
-
-      zip.file('manifest.json', JSON.stringify(manifest, null, 2));
-
-      const zipBuffer = Buffer.from(
-        await zip.generateAsync({
-          type: 'nodebuffer',
-          compression: useStored ? 'STORE' : 'DEFLATE',
-          compressionOptions: useStored ? undefined : { level: 1 },
-        }),
-      );
-
-      const bad = getBadBoundaries(zipBuffer);
-      if (bad.length === 0) {
-        dbg('zip', `preload batch: ${batchNames.length} images, ${zipBuffer.length} bytes`);
-        zips.push(zipBuffer);
-        built = true;
-        break;
-      }
-
-      padContent = useStored
-        ? 'A'.repeat(attempt + 1)
-        : randomString(8 * (attempt + 1));
-    }
-
-    if (!built) {
-      throw new Error(`Failed to build preload ZIP batch after ${MAX_RETRIES} attempts`);
-    }
-  }
-
-  return zips;
 }
 
 /**
@@ -162,10 +87,7 @@ async function buildRawZip(
       entry.ViewParam[0].Text = config.label;
     }
 
-    if (config.iconRef) {
-      // Reference a preloaded/cached image by path — no image data in ZIP
-      entry.ViewParam[0].Icon = config.iconRef;
-    } else if (config.image) {
+    if (config.image) {
       const iconName = `btn_${index}_${zipSeq}.png`;
       zip.file(`icons/${iconName}`, config.image);
       entry.ViewParam[0].Icon = `icons/${iconName}`;
