@@ -13,6 +13,11 @@ import { dbg, dbgVerbose, hexDump, isVerbose } from './debug';
 const INVALID_BYTES = new Set([0x00, 0x7c]);
 const MAX_RETRIES = 50;
 
+// Monotonic counter to generate unique icon filenames per ZIP.
+// The device caches images by path — reusing the same name with
+// different content causes the device to show stale images.
+let zipSeq = 0;
+
 function randomString(length: number): string {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let result = '';
@@ -83,7 +88,7 @@ export async function buildButtonZip(
       }
 
       if (config.image) {
-        const iconName = `btn_${index}.png`;
+        const iconName = `btn_${index}_${zipSeq}.png`;
         zip.file(`icons/${iconName}`, config.image);
         entry.ViewParam[0].Icon = `icons/${iconName}`;
       }
@@ -123,6 +128,7 @@ export async function buildButtonZip(
         }
       }
 
+      zipSeq++;
       return zipBuffer;
     }
 

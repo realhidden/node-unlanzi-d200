@@ -103,25 +103,38 @@ export class UlanziD200 extends EventEmitter {
    * Open the first available Ulanzi D200 device.
    */
   static open(): UlanziD200 {
-    const devices = HID.devices().filter(
+    const allMatching = HID.devices().filter(
       (d) => d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID,
     );
 
-    if (devices.length === 0) {
+    if (allMatching.length === 0) {
       throw new Error(
         `Ulanzi D200 not found (VID: ${VENDOR_ID.toString(16)}, PID: ${PRODUCT_ID.toString(16)}). ` +
         'Is the device connected? On Linux, check udev rules.',
       );
     }
 
-    const deviceInfo = devices[0];
-    dbg('hid', `opening device: path=${deviceInfo.path}`);
-    dbg('hid', `  vendor=${deviceInfo.vendorId?.toString(16)} product=${deviceInfo.productId?.toString(16)}`);
-    dbg('hid', `  manufacturer="${deviceInfo.manufacturer}" product="${deviceInfo.product}"`);
-    dbg('hid', `  interface=${deviceInfo.interface} usage=${deviceInfo.usage} usagePage=${deviceInfo.usagePage}`);
+    for (const d of allMatching) {
+      dbg('hid', `found interface=${d.interface} usage=${d.usage} usagePage=${d.usagePage} path=${d.path}`);
+    }
 
-    const hid = new HID.HID(deviceInfo.path!);
-    return new UlanziD200(hid);
+    // The D200 exposes multiple HID interfaces. We need the consumer
+    // control interface (interface 0), not the keyboard interface (1).
+    // Try each matching device until one opens successfully.
+    const sorted = [...allMatching].sort((a, b) => (a.interface ?? 99) - (b.interface ?? 99));
+
+    for (const deviceInfo of sorted) {
+      try {
+        dbg('hid', `trying: interface=${deviceInfo.interface} usagePage=${deviceInfo.usagePage} path=${deviceInfo.path}`);
+        const hid = new HID.HID(deviceInfo.path!);
+        dbg('hid', `opened successfully`);
+        return new UlanziD200(hid);
+      } catch (err) {
+        dbg('hid', `failed: ${err}`);
+      }
+    }
+
+    throw new Error('Ulanzi D200 found but could not open any HID interface');
   }
 
   /**
@@ -351,10 +364,11 @@ export class UlanziD200 extends EventEmitter {
 
     let running = true;
     let frameIndex = 0;
-    const intervalMs = Math.max(67, Math.round(1000 / fps));
+    const intervalMs = Math.round(1000 / fps);
 
     const loop = async () => {
       while (running) {
+        const frameStart = Date.now();
         try {
           // Write directly to state — frames are already prepared
           this.buttonState.set(index, { image: prepared[frameIndex] });
@@ -363,7 +377,11 @@ export class UlanziD200 extends EventEmitter {
         } catch {
           // device busy
         }
-        await sleep(intervalMs);
+        // Only sleep the remaining time — render already consumed part of the interval
+        const elapsed = Date.now() - frameStart;
+        if (elapsed < intervalMs) {
+          await sleep(intervalMs - elapsed);
+        }
       }
     };
     loop();
