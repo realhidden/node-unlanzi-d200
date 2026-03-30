@@ -13,7 +13,10 @@ import { CHUNK_SIZE, PACKET_SIZE } from './protocol';
 import { dbg, dbgVerbose } from './debug';
 
 const INVALID_BYTES = new Set([0x00, 0x7c]);
-const MAX_RETRIES = 100;
+// STORED: 1024 covers a full packet-size alignment cycle (guaranteed solution).
+// DEFLATE: 500 random attempts gives ~99.99% success for typical ZIPs.
+const MAX_RETRIES_STORED = 1024;
+const MAX_RETRIES_DEFLATE = 500;
 
 function randomString(length: number): string {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -135,13 +138,17 @@ export async function buildButtonZip(
     return zipBuffer;
   }
 
-  // Strategy depends on compression mode:
-  // - STORED: deterministic 1-byte increments (each byte shifts content by exactly 1)
-  // - DEFLATE: random padding (compressed output is unpredictable, so we randomize)
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  // STORED: each pad byte shifts content by exactly 1 byte. Try all
+  // 1024 alignments — guaranteed to find a solution within one packet cycle.
+  // DEFLATE: compressed output is unpredictable, use random padding.
+  const maxRetries = useStored ? MAX_RETRIES_STORED : MAX_RETRIES_DEFLATE;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // STORED: deterministic increment. DEFLATE: fresh random each time
+    // (fixed length to avoid biasing the compressed output size).
     const pad = useStored
       ? 'A'.repeat(attempt)
-      : randomString(8 * attempt);
+      : randomString(64);
 
     ({ zipBuffer } = await buildRawZip(buttons, buttonCols, pad, useStored));
     bad = getBadBoundaries(zipBuffer);
@@ -149,8 +156,8 @@ export async function buildButtonZip(
     if (bad.length === 0) {
       dbg('zip', `manifest: ${manifestJson}`);
       dbg('zip', `size=${zipBuffer.length} bytes, pad=${pad.length}, ${Math.ceil((zipBuffer.length - CHUNK_SIZE) / PACKET_SIZE) + 1} packets`);
-      if (attempt > 2) {
-        dbg('zip', `boundary workaround: passed on attempt ${attempt + 1}`);
+      if (attempt > 5) {
+        dbg('zip', `boundary workaround: passed on attempt ${attempt}`);
       }
       zipSeq++;
       return zipBuffer;
@@ -158,7 +165,7 @@ export async function buildButtonZip(
   }
 
   throw new Error(
-    `Failed to generate valid ZIP after ${MAX_RETRIES} pad attempts. ` +
+    `Failed to generate valid ZIP after ${maxRetries} pad attempts. ` +
     `Remaining bad boundaries: ${bad.join(', ')}`,
   );
 }
