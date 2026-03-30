@@ -81,7 +81,6 @@ export class UlanziD200 extends EventEmitter {
 
   private device: HID.HID;
   private polling = false;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
   private animationTimers = new Map<number, { stop: () => void }>();
 
   // Write queue ensures only one HID transfer happens at a time
@@ -135,38 +134,41 @@ export class UlanziD200 extends EventEmitter {
   }
 
   /**
-   * Start polling for button events.
-   * Emits 'button', 'press', and 'release' events.
+   * Start listening for button events.
+   * Uses node-hid's async read (internal thread) so the event loop
+   * is never blocked — Ctrl+C and other signals work immediately.
    */
-  startPolling(intervalMs = 50): void {
+  startPolling(): void {
     if (this.polling) return;
     this.polling = true;
 
-    this.pollTimer = setInterval(() => {
-      this.readOnce();
-    }, intervalMs);
+    this.device.on('data', (data: Buffer) => {
+      this.handleData(data);
+    });
+    this.device.on('error', (err: Error) => {
+      this.emit('error', err);
+    });
   }
 
   /**
-   * Stop polling for button events.
+   * Stop listening for button events.
    */
   stopPolling(): void {
     this.polling = false;
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+    this.device.removeAllListeners('data');
+    this.device.removeAllListeners('error');
+    try {
+      this.device.pause();
+    } catch {
+      // ignore — device may already be closed
     }
   }
 
   /**
-   * Read a single packet from the device (non-blocking).
+   * Handle an incoming HID data packet.
    */
-  private readOnce(): void {
+  private handleData(buf: Buffer): void {
     try {
-      const data = this.device.readSync();
-      if (!data || data.length === 0) return;
-
-      const buf = Buffer.from(data);
       dbgVerbose('recv', `raw ${hexDump(buf, 16)}`);
 
       const parsed = parsePacket(buf);
