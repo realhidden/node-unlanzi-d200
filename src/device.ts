@@ -220,6 +220,11 @@ export class UlanziD200 extends EventEmitter {
           }
           break;
         }
+        // Device ack/status messages — safe to ignore
+        case InCommand.ACK_0103:
+        case InCommand.ACK_010B:
+          dbgVerbose('recv', `${cmdName} (ack)`);
+          break;
         case InCommand.DEVICE_INFO: {
           const info = parseDeviceInfo(parsed.data);
           dbg('recv', `DEVICE_INFO: "${info}"`);

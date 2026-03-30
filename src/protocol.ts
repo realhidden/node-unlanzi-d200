@@ -38,12 +38,16 @@ export const OutCommandName: Record<number, string> = {
 export enum InCommand {
   BUTTON = 0x0101,
   BUTTON_2 = 0x0102,
+  ACK_0103 = 0x0103,
+  ACK_010B = 0x010b,
   DEVICE_INFO = 0x0303,
 }
 
 export const InCommandName: Record<number, string> = {
   [InCommand.BUTTON]: 'BUTTON',
   [InCommand.BUTTON_2]: 'BUTTON_2',
+  [InCommand.ACK_0103]: 'ACK_0103',
+  [InCommand.ACK_010B]: 'ACK_010B',
   [InCommand.DEVICE_INFO]: 'DEVICE_INFO',
 };
 
