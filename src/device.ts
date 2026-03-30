@@ -199,11 +199,11 @@ export class UlanziD200 extends EventEmitter {
         case InCommand.BUTTON_2: {
           const press = parseButtonPress(parsed.data);
           if (press) {
-            // Button 13 is the info window — it sends continuous status
-            // updates (~8/sec) with the display mode in the state field.
-            // These are NOT real button presses.
+            // Button 13 is the info window — it sends periodic status
+            // updates (~8/sec) that are NOT real button presses.
+            // Filter them out to avoid flooding the render loop.
             if (press.index === 13) {
-              dbgVerbose('recv', `info-window mode=${press.state} raw=[${parsed.data.subarray(0, 4).toString('hex')}]`);
+              dbgVerbose('recv', `info-window mode=${press.state}`);
               this.emit('info-window', { mode: press.state });
               break;
             }
@@ -318,7 +318,7 @@ export class UlanziD200 extends EventEmitter {
   ): Promise<void> {
     for (const [indexStr, value] of Object.entries(buttons)) {
       const index = Number(indexStr);
-      if (index < 0 || index > 12) continue;
+      if (index < 0 || index > 13) continue;
 
       let config: ButtonConfig;
       if (Buffer.isBuffer(value)) {
@@ -346,7 +346,7 @@ export class UlanziD200 extends EventEmitter {
     index: number,
     config: ButtonConfig | string | Buffer,
   ): Promise<void> {
-    if (index < 0 || index > 12) return;
+    if (index < 0 || index > 13) return;
 
     let resolved: ButtonConfig;
     if (Buffer.isBuffer(config)) {

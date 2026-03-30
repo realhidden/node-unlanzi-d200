@@ -68,9 +68,11 @@ async function main() {
   const deck = UlanziD200.open();
   console.log('Connected!');
 
-  // Handle cleanup on exit
+  let clock: { stop: () => void } | null = null;
+
   process.on('SIGINT', () => {
     console.log('\nShutting down...');
+    clock?.stop();
     deck.close();
     process.exit(0);
   });
@@ -106,15 +108,9 @@ async function main() {
   await deck.setButtons(buttons);
   console.log('All 13 buttons set.');
 
-  // 5. Update the small window (clock mode)
-  console.log('Setting clock display...');
-  deck.setSmallWindow({ mode: SmallWindowMode.CLOCK });
-
-  // Keep the clock updated every 5 seconds (not every 1s to avoid
-  // competing with button updates for the write queue)
-  setInterval(() => {
-    deck.setSmallWindow({ mode: SmallWindowMode.CLOCK });
-  }, 5000);
+  // 5. Start clock on the info window (clears Ulanzi logo, shows time)
+  console.log('Starting clock...');
+  clock = await deck.startClock();
 
   // 6. Listen for button presses
   console.log('Listening for button presses (Ctrl+C to quit)...\n');
