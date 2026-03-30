@@ -272,6 +272,21 @@ export class UlanziD200 extends EventEmitter {
   }
 
   /**
+   * Set the info window to BACKGROUND mode (hides the stats/clock overlay).
+   * Call this before setButtons/setButton if you want the info panel area
+   * to show a custom image (button index 13) instead of system metrics.
+   *
+   * Pass `false` to restore the default clock/stats display.
+   */
+  setInfoWindowBackground(enabled = true): void {
+    if (enabled) {
+      this.setSmallWindow({ mode: SmallWindowMode.BACKGROUND });
+    } else {
+      this.setSmallWindow({ mode: SmallWindowMode.CLOCK });
+    }
+  }
+
+  /**
    * Set images/labels on multiple buttons. This is the initial/bulk setter.
    * Always sends a full SET_BUTTONS with all provided buttons.
    *
@@ -282,7 +297,7 @@ export class UlanziD200 extends EventEmitter {
   ): Promise<void> {
     for (const [indexStr, value] of Object.entries(buttons)) {
       const index = Number(indexStr);
-      if (index < 0 || index > 12) continue;
+      if (index < 0 || index > 13) continue;
 
       let config: ButtonConfig;
       if (Buffer.isBuffer(value)) {
@@ -310,7 +325,7 @@ export class UlanziD200 extends EventEmitter {
     index: number,
     config: ButtonConfig | string | Buffer,
   ): Promise<void> {
-    if (index < 0 || index > 12) return;
+    if (index < 0 || index > 13) return;
 
     let resolved: ButtonConfig;
     if (Buffer.isBuffer(config)) {
