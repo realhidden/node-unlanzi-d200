@@ -88,14 +88,12 @@ async function buildRawZip(
   const manifestJson = JSON.stringify(manifest, null, 2);
   zip.file('manifest.json', manifestJson);
 
-  // Use DEFLATE — even though PNGs are already compressed, the device
-  // struggles with very large STORED ZIPs (buttons 9+ go black).
-  // Level 1 is fast and shaves enough bytes to stay within device limits.
+  // STORED compression — PNGs are already compressed, DEFLATE just
+  // wastes CPU and makes retries expensive
   const zipBuffer = Buffer.from(
     await zip.generateAsync({
       type: 'nodebuffer',
-      compression: 'DEFLATE',
-      compressionOptions: { level: 1 },
+      compression: 'STORE',
     }),
   );
 

@@ -120,20 +120,16 @@ async function main() {
     }
   }
 
-  // Hide the stats/clock overlay on the info window so we can
-  // put an image there too (button 13)
-  deck.setInfoWindowBackground();
-
-  // Animate ALL 14 buttons (13 + info window) with staggered start frames
-  const totalButtons = 14;
-  console.log(`Starting animation on all ${totalButtons} buttons (staggered)...`);
-  const stagger = Math.max(1, Math.floor(animFrames.length / totalButtons));
-  for (let i = 0; i < totalButtons; i++) {
+  // Animate ALL 13 buttons with staggered start frames
+  console.log('Starting animation on all 13 buttons (staggered)...');
+  const stagger = Math.max(1, Math.floor(animFrames.length / 13));
+  for (let i = 0; i < 13; i++) {
+    // Offset the frames so each button starts at a different point
     const offset = (i * stagger) % animFrames.length;
     const shifted = [...animFrames.slice(offset), ...animFrames.slice(0, offset)];
     await deck.animateButton(i, shifted, 10);
   }
-  console.log(`All ${totalButtons} buttons animating!`);
+  console.log('All 13 buttons animating!');
 
   deck.startPolling();
   deck.on('press', (index) => {
