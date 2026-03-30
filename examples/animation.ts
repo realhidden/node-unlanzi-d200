@@ -96,11 +96,15 @@ async function main() {
 
   deck.setBrightness(80);
 
+  // Lower post-transfer delay for animation — small ZIPs (1-2 buttons)
+  // process much faster than full 13-button ZIPs
+  deck.postTransferDelayMs = 20;
+
   // Rainbow animation on button 0
   console.log('Generating 24 rainbow frames...');
   const rainbowFrames = await generateRainbowFrames(24);
   console.log('Starting rainbow animation on button 0 at 8 FPS...');
-  deck.animateButton(0, rainbowFrames, 8);
+  await deck.animateButton(0, rainbowFrames, 8);
 
   // If a GIF file is provided as CLI argument, animate it on button 1
   const gifArg = process.argv[2];
@@ -110,7 +114,7 @@ async function main() {
       console.log(`Loading GIF: ${gifPath}`);
       const gifFrames = await extractGifFrames(gifPath);
       console.log(`Extracted ${gifFrames.length} frames. Animating on button 1...`);
-      deck.animateButton(1, gifFrames, 10);
+      await deck.animateButton(1, gifFrames, 10);
     } else {
       console.error(`GIF file not found: ${gifPath}`);
     }

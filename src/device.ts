@@ -335,14 +335,19 @@ export class UlanziD200 extends EventEmitter {
    * @param fps - Frames per second (default: 10, max ~15 due to USB bandwidth)
    * @returns A stop function to cancel the animation
    */
-  animateButton(
+  async animateButton(
     index: number,
     frames: Buffer[],
     fps = 10,
-  ): { stop: () => void } {
+  ): Promise<{ stop: () => void }> {
     if (frames.length === 0) throw new Error('No frames provided');
 
     this.stopAnimation(index);
+
+    // Pre-process all frames once (resize to 196x196 PNG)
+    const prepared = await Promise.all(
+      frames.map((f) => this.prepareImage(f)),
+    );
 
     let running = true;
     let frameIndex = 0;
@@ -351,8 +356,10 @@ export class UlanziD200 extends EventEmitter {
     const loop = async () => {
       while (running) {
         try {
-          await this.setButton(index, { image: frames[frameIndex] });
-          frameIndex = (frameIndex + 1) % frames.length;
+          // Write directly to state — frames are already prepared
+          this.buttonState.set(index, { image: prepared[frameIndex] });
+          frameIndex = (frameIndex + 1) % prepared.length;
+          await this.requestRender();
         } catch {
           // device busy
         }
