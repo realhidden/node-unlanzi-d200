@@ -265,7 +265,15 @@ export class UlanziD200 extends EventEmitter {
   }
 
   /**
-   * Set the small window (clock/stats area) data.
+   * Set the info window (the large panel, button 13) display mode and data.
+   *
+   * Modes:
+   * - STATS (0): Shows CPU%, MEM%, GPU% gauges
+   * - CLOCK (1): Shows current time
+   * - BACKGROUND (2): Shows Ulanzi logo / custom background
+   *
+   * The info window needs periodic updates to stay alive (especially
+   * for CLOCK mode — send every 1-5 seconds to keep the time current).
    */
   setSmallWindow(data: SmallWindowData): void {
     const mode = data.mode ?? SmallWindowMode.CLOCK;
@@ -276,6 +284,20 @@ export class UlanziD200 extends EventEmitter {
 
     const payload = Buffer.from(`${mode}|${cpu}|${mem}|${time}|${gpu}`, 'utf-8');
     this.enqueueWrite('SET_SMALL_WINDOW', () => { this.writeRaw(buildPacket(OutCommand.SET_SMALL_WINDOW_DATA, payload)); });
+  }
+
+  /**
+   * Start a clock on the info window that auto-updates every second.
+   * Returns a stop function.
+   */
+  startClock(): { stop: () => void } {
+    this.setSmallWindow({ mode: SmallWindowMode.CLOCK });
+    const timer = setInterval(() => {
+      this.setSmallWindow({ mode: SmallWindowMode.CLOCK });
+    }, 1000);
+    return {
+      stop: () => clearInterval(timer),
+    };
   }
 
   /**
@@ -364,9 +386,10 @@ export class UlanziD200 extends EventEmitter {
 
     this.stopAnimation(index);
 
-    // Pre-process all frames once (resize to 196x196 PNG)
+    // Pre-process all frames once — use JPEG for smaller sizes (3-4x smaller
+    // than PNG), which means fewer HID packets per frame = smoother animation
     const prepared = await Promise.all(
-      frames.map((f) => this.prepareImage(f)),
+      frames.map((f) => this.prepareImage(f, true)),
     );
 
     let running = true;
@@ -434,14 +457,19 @@ export class UlanziD200 extends EventEmitter {
 
   // ── internal ──────────────────────────────────────────────
 
-  private async prepareImage(image: Buffer): Promise<Buffer> {
-    return sharp(image)
+  private async prepareImage(image: Buffer, jpeg = false): Promise<Buffer> {
+    let pipeline = sharp(image)
       .resize(UlanziD200.ICON_SIZE, UlanziD200.ICON_SIZE, {
         fit: 'contain',
         background: { r: 0, g: 0, b: 0, alpha: 1 },
-      })
-      .png()
-      .toBuffer();
+      });
+    // JPEG is much smaller (~5-8KB vs ~25KB PNG) — better for animation
+    if (jpeg) {
+      pipeline = pipeline.flatten({ background: { r: 0, g: 0, b: 0 } }).jpeg({ quality: 85 });
+    } else {
+      pipeline = pipeline.png();
+    }
+    return pipeline.toBuffer();
   }
 
   /**

@@ -90,15 +90,18 @@ async function main() {
 
   process.on('SIGINT', () => {
     console.log('\nStopping...');
+    clock?.stop();
     deck.close();
     process.exit(0);
   });
 
   deck.setBrightness(80);
-  // Tune for animation performance
   deck.postTransferDelayMs = 30;
   deck.batchDelayMs = 5;
-  deck.useStoredCompression = true; // faster ZIP builds for animation
+  deck.useStoredCompression = true;
+
+  // Start a clock on the info window (button 13)
+  const clock = deck.startClock();
 
   // Generate rainbow frames shared by all buttons
   const frameCount = 24;
