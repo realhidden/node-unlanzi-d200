@@ -13,19 +13,6 @@ import { CHUNK_SIZE, PACKET_SIZE } from './protocol';
 import { dbg, dbgVerbose } from './debug';
 
 const INVALID_BYTES = new Set([0x00, 0x7c]);
-// STORED: 1024 covers a full packet-size alignment cycle (guaranteed solution).
-// DEFLATE: 500 random attempts gives ~99.99% success for typical ZIPs.
-const MAX_RETRIES_STORED = 1024;
-const MAX_RETRIES_DEFLATE = 500;
-
-function randomString(length: number): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-}
 
 // Monotonic counter to generate unique icon filenames per ZIP.
 // The device caches images by path — reusing the same name with
@@ -65,16 +52,23 @@ export interface ManifestEntry {
 async function buildRawZip(
   buttons: Map<number, ButtonConfig>,
   buttonCols: number,
-  padContent: string,
+  padSize: number,
   useStored: boolean,
 ): Promise<{ zipBuffer: Buffer; manifestJson: string }> {
   const zip = new JSZip();
   const manifest: Record<string, ManifestEntry> = {};
 
-  // Pad file goes first in the ZIP
-  if (padContent.length > 0) {
-    zip.file('pad.txt', padContent);
+  // Pad file is ALWAYS stored as raw bytes (never compressed), so each
+  // byte we add shifts the rest of the ZIP by exactly 1 byte. This makes
+  // the boundary workaround deterministic regardless of image compression.
+  if (padSize > 0) {
+    zip.file('pad.txt', 'A'.repeat(padSize), { compression: 'STORE' });
   }
+
+  const imageCompression = useStored ? 'STORE' : 'DEFLATE';
+  const imageOptions = useStored
+    ? { compression: 'STORE' as const }
+    : { compression: 'DEFLATE' as const, compressionOptions: { level: 1 } };
 
   for (const [index, config] of buttons) {
     const col = index % buttonCols;
@@ -92,7 +86,7 @@ async function buildRawZip(
 
     if (config.image) {
       const iconName = `btn_${index}_${zipSeq}.png`;
-      zip.file(`icons/${iconName}`, config.image);
+      zip.file(`icons/${iconName}`, config.image, imageOptions);
       entry.ViewParam[0].Icon = `icons/${iconName}`;
     }
 
@@ -100,14 +94,10 @@ async function buildRawZip(
   }
 
   const manifestJson = JSON.stringify(manifest, null, 2);
-  zip.file('manifest.json', manifestJson);
+  zip.file('manifest.json', manifestJson, imageOptions);
 
   const zipBuffer = Buffer.from(
-    await zip.generateAsync({
-      type: 'nodebuffer',
-      compression: useStored ? 'STORE' : 'DEFLATE',
-      compressionOptions: useStored ? undefined : { level: 1 },
-    }),
+    await zip.generateAsync({ type: 'nodebuffer' }),
   );
 
   return { zipBuffer, manifestJson };
@@ -128,7 +118,7 @@ export async function buildButtonZip(
   useStored = false,
 ): Promise<Buffer> {
   // First try: no padding
-  let { zipBuffer, manifestJson } = await buildRawZip(buttons, buttonCols, '', useStored);
+  let { zipBuffer, manifestJson } = await buildRawZip(buttons, buttonCols, 0, useStored);
   let bad = getBadBoundaries(zipBuffer);
 
   if (bad.length === 0) {
@@ -138,34 +128,27 @@ export async function buildButtonZip(
     return zipBuffer;
   }
 
-  // STORED: each pad byte shifts content by exactly 1 byte. Try all
-  // 1024 alignments — guaranteed to find a solution within one packet cycle.
-  // DEFLATE: compressed output is unpredictable, use random padding.
-  const maxRetries = useStored ? MAX_RETRIES_STORED : MAX_RETRIES_DEFLATE;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    // STORED: deterministic increment. DEFLATE: fresh random each time
-    // (fixed length to avoid biasing the compressed output size).
-    const pad = useStored
-      ? 'A'.repeat(attempt)
-      : randomString(64);
-
-    ({ zipBuffer } = await buildRawZip(buttons, buttonCols, pad, useStored));
+  // The pad.txt is always STORED (raw bytes), so each byte added shifts
+  // ALL subsequent content by exactly 1. Trying 1024 sizes covers every
+  // possible alignment against the 1024-byte packet grid. Guaranteed.
+  for (let padSize = 1; padSize <= PACKET_SIZE; padSize++) {
+    ({ zipBuffer } = await buildRawZip(buttons, buttonCols, padSize, useStored));
     bad = getBadBoundaries(zipBuffer);
 
     if (bad.length === 0) {
       dbg('zip', `manifest: ${manifestJson}`);
-      dbg('zip', `size=${zipBuffer.length} bytes, pad=${pad.length}, ${Math.ceil((zipBuffer.length - CHUNK_SIZE) / PACKET_SIZE) + 1} packets`);
-      if (attempt > 5) {
-        dbg('zip', `boundary workaround: passed on attempt ${attempt}`);
+      dbg('zip', `size=${zipBuffer.length} bytes, pad=${padSize}, ${Math.ceil((zipBuffer.length - CHUNK_SIZE) / PACKET_SIZE) + 1} packets`);
+      if (padSize > 5) {
+        dbg('zip', `boundary workaround: passed on attempt ${padSize}`);
       }
       zipSeq++;
       return zipBuffer;
     }
   }
 
+  // Mathematically impossible to reach here with STORED pad — but just in case
   throw new Error(
-    `Failed to generate valid ZIP after ${maxRetries} pad attempts. ` +
+    `Failed to generate valid ZIP after 1024 pad attempts. ` +
     `Remaining bad boundaries: ${bad.join(', ')}`,
   );
 }
