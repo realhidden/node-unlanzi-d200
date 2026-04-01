@@ -3,6 +3,7 @@ export type {
   LabelStyle,
   SmallWindowData,
   UlanziD200Events,
+  ReconnectOptions,
   DebugLevel,
 } from './device';
 export { ButtonConfig } from './zip';

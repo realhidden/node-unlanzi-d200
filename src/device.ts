@@ -55,6 +55,19 @@ export interface UlanziD200Events {
   'device-info': (info: string) => void;
   'error': (error: Error) => void;
   'close': () => void;
+  'disconnect': () => void;
+  'reconnect': () => void;
+}
+
+export interface ReconnectOptions {
+  /** Enable auto-reconnect when the device disconnects (default: false) */
+  autoReconnect?: boolean;
+  /** Delay in ms between reconnection attempts (default: 2000) */
+  reconnectDelayMs?: number;
+  /** Max reconnection attempts before giving up. 0 = infinite (default: 0) */
+  maxAttempts?: number;
+  /** Re-apply button state after reconnecting (default: true) */
+  restoreState?: boolean;
 }
 
 export declare interface UlanziD200 {
@@ -89,7 +102,9 @@ export class UlanziD200 extends EventEmitter {
   infoWindowAsButton = false;
 
   private device: HID.HID;
+  private _connected = true;
   private polling = false;
+  private wasPolling = false;
   private animationTimers = new Map<number, { stop: () => void }>();
 
   // Write queue ensures only one HID transfer happens at a time
@@ -103,15 +118,74 @@ export class UlanziD200 extends EventEmitter {
   private rendering = false;
   private renderWaiters: Array<() => void> = [];
 
-  constructor(device: HID.HID) {
+  // Reconnection
+  private reconnectOpts: Required<ReconnectOptions> = {
+    autoReconnect: false,
+    reconnectDelayMs: 2000,
+    maxAttempts: 0,
+    restoreState: true,
+  };
+  private reconnecting = false;
+  private reconnectAbort: (() => void) | null = null;
+  private lastBrightness: number | null = null;
+  private lastLabelStyle: LabelStyle | null = null;
+
+  /** True when the HID device is open and usable */
+  get connected(): boolean {
+    return this._connected;
+  }
+
+  constructor(device: HID.HID, reconnectOpts?: ReconnectOptions) {
     super();
     this.device = device;
+    if (reconnectOpts) {
+      Object.assign(this.reconnectOpts, reconnectOpts);
+    }
   }
 
   /**
    * Open the first available Ulanzi D200 device.
    */
-  static open(): UlanziD200 {
+  static open(reconnectOpts?: ReconnectOptions): UlanziD200 {
+    const hid = UlanziD200.openHID();
+    return new UlanziD200(hid, reconnectOpts);
+  }
+
+  /**
+   * Open the device with retries — useful when the device may still be
+   * enumerating on USB (e.g. after a reboot or hot-plug).
+   *
+   * @param timeoutMs - Max time to wait for the device (default: 30000)
+   * @param intervalMs - Time between attempts (default: 1000)
+   */
+  static async openWithRetry(
+    options?: { timeoutMs?: number; intervalMs?: number } & ReconnectOptions,
+  ): Promise<UlanziD200> {
+    const timeoutMs = options?.timeoutMs ?? 30_000;
+    const intervalMs = options?.intervalMs ?? 1_000;
+
+    const deadline = Date.now() + timeoutMs;
+    let lastError: Error | undefined;
+
+    while (Date.now() < deadline) {
+      try {
+        const hid = UlanziD200.openHID();
+        dbg('hid', 'openWithRetry: connected');
+        return new UlanziD200(hid, options);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        dbg('hid', `openWithRetry: ${lastError.message}, retrying in ${intervalMs}ms`);
+        await sleep(Math.min(intervalMs, deadline - Date.now()));
+      }
+    }
+
+    throw lastError ?? new Error('Ulanzi D200 not found');
+  }
+
+  /**
+   * Low-level: open and return the raw HID device handle.
+   */
+  private static openHID(): HID.HID {
     const allMatching = HID.devices().filter(
       (d) => d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID,
     );
@@ -137,7 +211,7 @@ export class UlanziD200 extends EventEmitter {
         dbg('hid', `trying: interface=${deviceInfo.interface} usagePage=${deviceInfo.usagePage} path=${deviceInfo.path}`);
         const hid = new HID.HID(deviceInfo.path!);
         dbg('hid', `opened successfully`);
-        return new UlanziD200(hid);
+        return hid;
       } catch (err) {
         dbg('hid', `failed: ${err}`);
       }
@@ -163,12 +237,15 @@ export class UlanziD200 extends EventEmitter {
   startPolling(): void {
     if (this.polling) return;
     this.polling = true;
+    this.attachListeners();
+  }
 
+  private attachListeners(): void {
     this.device.on('data', (data: Buffer) => {
       this.handleData(data);
     });
     this.device.on('error', (err: Error) => {
-      this.emit('error', err);
+      this.handleDeviceError(err);
     });
   }
 
@@ -250,6 +327,7 @@ export class UlanziD200 extends EventEmitter {
    */
   setBrightness(brightness: number): void {
     brightness = Math.max(0, Math.min(100, Math.round(brightness)));
+    this.lastBrightness = brightness;
     const data = Buffer.from(String(brightness), 'utf-8');
     this.enqueueWrite('SET_BRIGHTNESS', () => { this.writeRaw(buildPacket(OutCommand.SET_BRIGHTNESS, data)); });
   }
@@ -258,6 +336,7 @@ export class UlanziD200 extends EventEmitter {
    * Set the label style for all buttons.
    */
   setLabelStyle(style: LabelStyle): void {
+    this.lastLabelStyle = { ...style };
     const payload = {
       Align: style.align ?? 'bottom',
       Color: parseInt(style.color ?? 'FFFFFF', 16),
@@ -456,16 +535,163 @@ export class UlanziD200 extends EventEmitter {
     this.setSmallWindow({});
   }
 
+  /**
+   * Configure auto-reconnect behavior.
+   */
+  setReconnectOptions(opts: ReconnectOptions): void {
+    Object.assign(this.reconnectOpts, opts);
+  }
+
   close(): void {
+    // Cancel any pending reconnect
+    this.reconnectAbort?.();
+    this.reconnectAbort = null;
+    this.reconnecting = false;
+
     this.stopPolling();
     this.stopAllAnimations();
     this.rendering = false;
+    this._connected = false;
     try {
       this.device.close();
     } catch {
       // ignore
     }
     this.emit('close');
+  }
+
+  /**
+   * Handle a device error — if it looks like a disconnect, trigger
+   * the reconnect flow instead of just emitting 'error'.
+   */
+  private handleDeviceError(err: Error): void {
+    // If already disconnected, ignore follow-up errors
+    if (!this._connected) return;
+
+    // HID read errors on a disconnected device are the primary signal.
+    // node-hid throws "could not read from HID device" or similar.
+    dbg('hid', `device error: ${err.message}`);
+    this._connected = false;
+    this.wasPolling = this.polling;
+
+    // Stop writing to the dead handle
+    this.stopPolling();
+    // Reset the write queue so it doesn't block reconnect
+    this.writeQueue = Promise.resolve();
+    this.rendering = false;
+    const waiters = this.renderWaiters;
+    this.renderWaiters = [];
+    for (const r of waiters) r();
+
+    this.emit('disconnect');
+    this.emit('error', err);
+
+    if (this.reconnectOpts.autoReconnect) {
+      this.startReconnect();
+    }
+  }
+
+  /**
+   * Begin the reconnection loop. Tries to re-open the HID device
+   * and restore state. Emits 'reconnect' on success.
+   */
+  private startReconnect(): void {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    let cancelled = false;
+
+    this.reconnectAbort = () => { cancelled = true; };
+
+    const attempt = async () => {
+      const { reconnectDelayMs, maxAttempts, restoreState } = this.reconnectOpts;
+      let tries = 0;
+
+      while (!cancelled) {
+        tries++;
+        dbg('reconnect', `attempt ${tries}${maxAttempts > 0 ? `/${maxAttempts}` : ''}`);
+
+        try {
+          const hid = UlanziD200.openHID();
+
+          // Success — swap in the new handle
+          try { this.device.close(); } catch { /* old handle is dead */ }
+          this.device = hid;
+          this._connected = true;
+          this.reconnecting = false;
+          this.reconnectAbort = null;
+
+          dbg('reconnect', 'connected');
+
+          // Re-attach polling if it was active before disconnect
+          if (this.wasPolling) {
+            this.polling = false; // reset so startPolling works
+            this.startPolling();
+          }
+
+          // Restore state
+          if (restoreState) {
+            await this.restoreDeviceState();
+          }
+
+          this.emit('reconnect');
+          return;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          dbg('reconnect', `failed: ${msg}`);
+        }
+
+        if (maxAttempts > 0 && tries >= maxAttempts) {
+          dbg('reconnect', `gave up after ${tries} attempts`);
+          this.reconnecting = false;
+          this.reconnectAbort = null;
+          return;
+        }
+
+        await sleep(reconnectDelayMs);
+      }
+
+      this.reconnecting = false;
+      this.reconnectAbort = null;
+    };
+
+    attempt().catch((err) => {
+      dbg('reconnect', `unexpected error: ${err}`);
+      this.reconnecting = false;
+      this.reconnectAbort = null;
+    });
+  }
+
+  /**
+   * Re-send brightness, label style, and button images after reconnect.
+   */
+  private async restoreDeviceState(): Promise<void> {
+    dbg('reconnect', 'restoring device state');
+
+    if (this.lastBrightness != null) {
+      const data = Buffer.from(String(this.lastBrightness), 'utf-8');
+      this.enqueueWrite('RESTORE_BRIGHTNESS', () => {
+        this.writeRaw(buildPacket(OutCommand.SET_BRIGHTNESS, data));
+      });
+    }
+
+    if (this.lastLabelStyle) {
+      const payload = {
+        Align: this.lastLabelStyle.align ?? 'bottom',
+        Color: parseInt(this.lastLabelStyle.color ?? 'FFFFFF', 16),
+        FontName: this.lastLabelStyle.fontName ?? 'Roboto',
+        ShowTitle: this.lastLabelStyle.showTitle ?? true,
+        Size: this.lastLabelStyle.size ?? 10,
+        Weight: this.lastLabelStyle.weight ?? 80,
+      };
+      const data = Buffer.from(JSON.stringify(payload), 'utf-8');
+      this.enqueueWrite('RESTORE_LABEL_STYLE', () => {
+        this.writeRaw(buildPacket(OutCommand.SET_LABEL_STYLE, data));
+      });
+    }
+
+    if (this.buttonState.size > 0) {
+      await this.sendImmediate();
+    }
   }
 
   // ── internal ──────────────────────────────────────────────
@@ -566,16 +792,31 @@ export class UlanziD200 extends EventEmitter {
    * ensure only one transfer is in-flight at a time.
    */
   private enqueueWrite(label: string, fn: () => Promise<void> | void): Promise<void> {
+    if (!this._connected) {
+      dbg('queue', `${label}: skipped (disconnected)`);
+      return Promise.resolve();
+    }
     const seq = ++this.writeSeq;
     const task = this.writeQueue.then(async () => {
       dbgVerbose('queue', `#${seq} ${label}: executing`);
       await fn();
-
       dbgVerbose('queue', `#${seq} ${label}: done`);
-    }, async (err) => {
-      dbg('queue', `#${seq} ${label}: previous write errored (${err}), continuing`);
-      await fn();
-
+    }, async (prevErr) => {
+      dbg('queue', `#${seq} ${label}: previous write errored (${prevErr}), continuing`);
+      try {
+        await fn();
+      } catch (err) {
+        // Write failure on a connected device likely means disconnect
+        if (this._connected) {
+          this.handleDeviceError(err instanceof Error ? err : new Error(String(err)));
+        }
+        throw err;
+      }
+    }).catch((err) => {
+      // Catch write errors from the success path too
+      if (this._connected) {
+        this.handleDeviceError(err instanceof Error ? err : new Error(String(err)));
+      }
     });
     this.writeQueue = task;
     return task;
@@ -604,8 +845,12 @@ export class UlanziD200 extends EventEmitter {
 
   /**
    * Write a single raw packet to the HID device.
+   * Throws if the device is disconnected.
    */
   private writeRaw(packet: Buffer): number {
+    if (!this._connected) {
+      throw new Error('Device is disconnected');
+    }
     return this.device.write([...packet]);
   }
 }
