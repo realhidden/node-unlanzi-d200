@@ -40,6 +40,9 @@ export interface ButtonConfig {
 
 export interface ManifestEntry {
   State: number;
+  /** Small window mode for the wide info panel slot (3_2) — required for
+   *  the firmware to allocate the full panel width and link clock data */
+  SmallViewMode?: number;
   ViewParam: Array<{
     Text?: string;
     Icon?: string;
@@ -54,6 +57,7 @@ async function buildRawZip(
   buttonCols: number,
   padSize: number,
   useStored: boolean,
+  smallWindowMode?: number,
 ): Promise<{ zipBuffer: Buffer; manifestJson: string }> {
   const zip = new JSZip();
   const manifest: Record<string, ManifestEntry> = {};
@@ -93,6 +97,32 @@ async function buildRawZip(
     manifest[key] = entry;
   }
 
+  // The info panel ("3_2" slot, button index 13 on a 5-col layout) must
+  // carry SmallViewMode so the firmware allocates the full panel width
+  // and links it to the small-window clock/stats subsystem.
+  // Mirrors Ulanzi Studio captures (see redphx/strmdck).
+  if (smallWindowMode != null) {
+    const smallKey = '3_2';
+    const smallIndex = 3 + 2 * buttonCols; // col 3, row 2 → 13 with 5 cols
+    const config = buttons.get(smallIndex);
+    const isBackground = smallWindowMode === 2 /* SmallWindowMode.BACKGROUND */;
+    const entry: ManifestEntry = manifest[smallKey] ?? { State: 0, ViewParam: [{}] };
+    entry.State = config?.state ?? 0;
+    entry.SmallViewMode = smallWindowMode;
+    const vp = entry.ViewParam[0] ?? {};
+    vp.Text = '';
+    if (isBackground && !vp.Icon) {
+      // Background mode needs an image; nothing set → drop to plain entry
+      entry.SmallViewMode = smallWindowMode;
+    }
+    if (!isBackground) {
+      // Clock/stats render across the whole panel — no icon underneath
+      delete vp.Icon;
+    }
+    entry.ViewParam = [vp];
+    manifest[smallKey] = entry;
+  }
+
   const manifestJson = JSON.stringify(manifest, null, 2);
   zip.file('manifest.json', manifestJson, imageOptions);
 
@@ -116,9 +146,10 @@ export async function buildButtonZip(
   buttons: Map<number, ButtonConfig>,
   buttonCols: number,
   useStored = false,
+  smallWindowMode?: number,
 ): Promise<Buffer> {
   // First try: no padding
-  let { zipBuffer, manifestJson } = await buildRawZip(buttons, buttonCols, 0, useStored);
+  let { zipBuffer, manifestJson } = await buildRawZip(buttons, buttonCols, 0, useStored, smallWindowMode);
   let bad = getBadBoundaries(zipBuffer);
 
   if (bad.length === 0) {
@@ -132,7 +163,7 @@ export async function buildButtonZip(
   // ALL subsequent content by exactly 1. Trying 1024 sizes covers every
   // possible alignment against the 1024-byte packet grid. Guaranteed.
   for (let padSize = 1; padSize <= PACKET_SIZE; padSize++) {
-    ({ zipBuffer } = await buildRawZip(buttons, buttonCols, padSize, useStored));
+    ({ zipBuffer } = await buildRawZip(buttons, buttonCols, padSize, useStored, smallWindowMode));
     bad = getBadBoundaries(zipBuffer);
 
     if (bad.length === 0) {

@@ -20,11 +20,33 @@ import { dbg, dbgVerbose, hexDump, setDebugLevel, setDebugLogFile, type DebugLev
 
 export { setDebugLevel, setDebugLogFile, DebugLevel };
 
+/**
+ * Mode byte for OUT_SET_SMALL_WINDOW_DATA, confirmed from USBPcap captures
+ * of Ulanzi Studio (see redphx/strmdck, jcalado/companion-surface-d200):
+ *
+ *   0   — CPU + RAM + GPU stats gauges
+ *   1   — analog dial clock (device-rendered)
+ *   2   — background image (needs SmallViewMode:2 + Icon on the 3_2 ZIP slot)
+ *   200 — digital: time + "YYYY/MM/DD Weekday" suffix
+ *   201 — digital: time + "Weekday" suffix
+ *   202 — digital: time + "YYYY/MM/DD" suffix
+ *   203 — digital: time only
+ *
+ * Payload format: `mode|cpu|mem|HH:MM:SS|gpu|24H|suffix`
+ */
 export enum SmallWindowMode {
   STATS = 0,
-  CLOCK = 1,
+  DIAL = 1,
   BACKGROUND = 2,
+  DIGITAL_DATE_TIME_WEEKDAY = 200,
+  DIGITAL_TIME_WEEKDAY = 201,
+  DIGITAL_TIME_DATE = 202,
+  DIGITAL_TIME = 203,
 }
+
+/** @deprecated alias for DIAL */
+const CLOCK = SmallWindowMode.DIAL;
+export { CLOCK };
 
 export interface LabelStyle {
   align?: 'top' | 'bottom' | 'center';
@@ -39,8 +61,15 @@ export interface SmallWindowData {
   mode?: SmallWindowMode;
   cpu?: number;
   mem?: number;
-  time?: string; // HH:MM:SS
   gpu?: number;
+  /** HH:MM:SS — defaults to current local time */
+  time?: string;
+  /** YYYY/MM/DD — used by modes 200/202 */
+  date?: string;
+  /** Weekday abbreviation ("Sun".."Sat") — used by modes 200/201 */
+  weekday?: string;
+  /** Display 12-hour clock on the device (default: 24-hour) */
+  twelveHour?: boolean;
 }
 
 export interface InfoWindowEvent {
@@ -79,6 +108,9 @@ export declare interface UlanziD200 {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Delay after opening a freshly re-enumerated device before writing to it */
+const RECONNECT_SETTLE_MS = 1_000;
+
 export class UlanziD200 extends EventEmitter {
   static readonly VENDOR_ID = VENDOR_ID;
   static readonly PRODUCT_ID = PRODUCT_ID;
@@ -100,6 +132,11 @@ export class UlanziD200 extends EventEmitter {
    * filtered as periodic status updates and only emit 'info-window'.
    */
   infoWindowAsButton = false;
+
+  /** Current small window (info panel) mode — stamped into SET_BUTTONS manifests */
+  private smallWindowMode: SmallWindowMode = SmallWindowMode.DIAL;
+  private twelveHour = false;
+  private clockTimer?: ReturnType<typeof setInterval>;
 
   private device: HID.HID;
   private _connected = true;
@@ -141,6 +178,10 @@ export class UlanziD200 extends EventEmitter {
     if (reconnectOpts) {
       Object.assign(this.reconnectOpts, reconnectOpts);
     }
+    // Safety net: with zero 'error' listeners Node turns any emitted
+    // error into an uncaught exception, killing the host process before
+    // auto-reconnect gets a chance to run.
+    this.on('error', () => {});
   }
 
   /**
@@ -350,46 +391,83 @@ export class UlanziD200 extends EventEmitter {
   }
 
   /**
-   * Set the info window (the large panel, button 13) display mode and data.
+   * Push data to the info window (the large panel, button 13 / "3_2" slot).
    *
-   * Modes:
-   * - STATS (0): Shows CPU%, MEM%, GPU% gauges
-   * - CLOCK (1): Shows current time
-   * - BACKGROUND (2): Shows Ulanzi logo / custom background
-   *
-   * The info window needs periodic updates to stay alive (especially
-   * for CLOCK mode — send every 1-5 seconds to keep the time current).
+   * Digital modes (200-203) render the time string sent here — push at
+   * least every few seconds to keep them current (startClock does this
+   * every second). DIAL renders itself from the time field as well.
    */
   setSmallWindow(data: SmallWindowData): void {
-    const mode = data.mode ?? SmallWindowMode.CLOCK;
+    const mode = data.mode ?? this.smallWindowMode;
+    this.smallWindowMode = mode;
+    if (data.twelveHour != null) this.twelveHour = data.twelveHour;
+
     const cpu = data.cpu ?? 0;
     const mem = data.mem ?? 0;
-    const time = data.time ?? new Date().toLocaleTimeString('en-GB');
     const gpu = data.gpu ?? 0;
 
-    const payload = Buffer.from(`${mode}|${cpu}|${mem}|${time}|${gpu}`, 'utf-8');
+    const d = new Date();
+    const pad2 = (n: number) => String(n).padStart(2, '0');
+    const time =
+      data.time ?? `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+    const date = data.date ?? `${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())}`;
+    const weekday = data.weekday ?? ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
+    const format = this.twelveHour ? '12H' : '24H';
+
+    let suffix = '';
+    switch (mode) {
+      case SmallWindowMode.DIGITAL_DATE_TIME_WEEKDAY:
+        suffix = `${date} ${weekday}`;
+        break;
+      case SmallWindowMode.DIGITAL_TIME_WEEKDAY:
+        suffix = weekday;
+        break;
+      case SmallWindowMode.DIGITAL_TIME_DATE:
+        suffix = date;
+        break;
+      default:
+        // STATS, DIAL, BACKGROUND, DIGITAL_TIME → empty suffix
+        break;
+    }
+
+    const payload = Buffer.from(
+      `${mode}|${cpu}|${mem}|${time}|${gpu}|${format}|${suffix}`,
+      'utf-8',
+    );
     this.enqueueWrite('SET_SMALL_WINDOW', () => { this.writeRaw(buildPacket(OutCommand.SET_SMALL_WINDOW_DATA, payload)); });
   }
 
   /**
    * Start a clock on the info window that auto-updates every second.
-   * Returns a stop function.
+   * Returns a stop function and a mode switcher.
    */
-  async startClock(): Promise<{ stop: () => void }> {
-    // Set a black background on button 13 to clear the Ulanzi logo
-    const black = Buffer.from(
-      '<svg width="196" height="196" xmlns="http://www.w3.org/2000/svg">' +
-      '<rect width="196" height="196" fill="black"/></svg>',
-    );
-    await this.setButton(13, { image: black });
+  async startClock(opts?: {
+    mode?: SmallWindowMode;
+    twelveHour?: boolean;
+  }): Promise<{ stop: () => void; setMode: (mode: SmallWindowMode) => void }> {
+    if (opts?.twelveHour != null) this.twelveHour = opts.twelveHour;
+    if (opts?.mode != null) this.smallWindowMode = opts.mode;
+    this.stopClockInterval();
 
-    this.setSmallWindow({ mode: SmallWindowMode.CLOCK });
-    const timer = setInterval(() => {
-      this.setSmallWindow({ mode: SmallWindowMode.CLOCK });
+    this.setSmallWindow({ mode: this.smallWindowMode });
+    this.clockTimer = setInterval(() => {
+      this.setSmallWindow({ mode: this.smallWindowMode });
     }, 1000);
+
     return {
-      stop: () => clearInterval(timer),
+      stop: () => this.stopClockInterval(),
+      setMode: (mode: SmallWindowMode) => {
+        this.smallWindowMode = mode;
+        this.setSmallWindow({ mode });
+      },
     };
+  }
+
+  private stopClockInterval(): void {
+    if (this.clockTimer) {
+      clearInterval(this.clockTimer);
+      this.clockTimer = undefined;
+    }
   }
 
   /**
@@ -548,6 +626,7 @@ export class UlanziD200 extends EventEmitter {
     this.reconnectAbort = null;
     this.reconnecting = false;
 
+    this.stopClockInterval();
     this.stopPolling();
     this.stopAllAnimations();
     this.rendering = false;
@@ -612,6 +691,16 @@ export class UlanziD200 extends EventEmitter {
 
         try {
           const hid = UlanziD200.openHID();
+
+          // Give the freshly enumerated device time to finish internal
+          // init before using it — writing too early can fail or leave
+          // the firmware in a bad state. Keep _connected=false during
+          // the settle window so app writes are safely skipped.
+          await sleep(RECONNECT_SETTLE_MS);
+          if (cancelled) {
+            try { hid.close(); } catch { /* already gone */ }
+            return;
+          }
 
           // Success — swap in the new handle
           try { this.device.close(); } catch { /* old handle is dead */ }
@@ -722,7 +811,7 @@ export class UlanziD200 extends EventEmitter {
 
     // Snapshot state so async ZIP build isn't affected by concurrent changes
     const snapshot = new Map(this.buttonState);
-    const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS, this.useStoredCompression);
+    const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS, this.useStoredCompression, this.smallWindowMode);
     const packets = buildFileTransferPackets(OutCommand.SET_BUTTONS, zipData);
     await this.enqueueWrite('SET_BUTTONS', () => this.writeFileTransfer(packets, 'SET_BUTTONS'));
   }
@@ -772,7 +861,7 @@ export class UlanziD200 extends EventEmitter {
         const indices = [...snapshot.keys()].sort((a, b) => a - b);
         dbg('render', `SET_BUTTONS [${indices.join(',')}] (${snapshot.size} buttons)`);
 
-        const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS, this.useStoredCompression);
+        const zipData = await buildButtonZip(snapshot, UlanziD200.BUTTON_COLS, this.useStoredCompression, this.smallWindowMode);
         const packets = buildFileTransferPackets(OutCommand.SET_BUTTONS, zipData);
 
         await this.enqueueWrite('SET_BUTTONS', () =>
