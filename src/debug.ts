@@ -43,3 +43,13 @@ export function isDebug(): boolean {
 export function isVerbose(): boolean {
   return level === 'verbose';
 }
+
+/**
+ * Always-on log for connection lifecycle milestones (open, verify,
+ * fallback, disconnect, reconnect). These are rare and are exactly what
+ * you need in a production log when the device stops responding, so they
+ * are not gated behind the debug level.
+ */
+export function info(tag: string, msg: string): void {
+  write(tag, msg);
+}

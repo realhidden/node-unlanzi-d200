@@ -16,7 +16,7 @@ import {
   ButtonPressData,
 } from './protocol';
 import { buildButtonZip, ButtonConfig } from './zip';
-import { dbg, dbgVerbose, hexDump, setDebugLevel, setDebugLogFile, type DebugLevel } from './debug';
+import { dbg, dbgVerbose, info, hexDump, setDebugLevel, setDebugLogFile, type DebugLevel } from './debug';
 
 export { setDebugLevel, setDebugLogFile, DebugLevel };
 
@@ -97,6 +97,15 @@ export interface ReconnectOptions {
   maxAttempts?: number;
   /** Re-apply button state after reconnecting (default: true) */
   restoreState?: boolean;
+  /**
+   * After opening, wait this long for inbound traffic to confirm the
+   * interface is the usable one; 0 disables the check (default: 0).
+   *
+   * Off by default because the D200 only reports once it has been
+   * configured — a fresh handle stays silent, so a non-zero value here
+   * costs this much per interface on every open and reconnect.
+   */
+  verifyMs?: number;
 }
 
 export declare interface UlanziD200 {
@@ -108,8 +117,23 @@ export declare interface UlanziD200 {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+const hex = (n?: number) => `0x${(n ?? 0).toString(16).padStart(4, '0')}`;
+
+/** Compact one-line description of a HID interface, for logs. */
+function describeDevice(d: HID.Device): string {
+  const names = [d.manufacturer, d.product].filter(Boolean).join(' ');
+  return (
+    `${hex(d.vendorId)}:${hex(d.productId)} iface=${d.interface ?? '?'} ` +
+    `usagePage=${hex(d.usagePage)} usage=${hex(d.usage)}` +
+    `${names ? ` "${names}"` : ''} path=${d.path ?? '?'}`
+  );
+}
+
 /** Delay after opening a freshly re-enumerated device before writing to it */
 const RECONNECT_SETTLE_MS = 1_000;
+
+/** Log a warning when a HID transfer takes longer than this */
+const SLOW_WRITE_MS = 1_500;
 
 export class UlanziD200 extends EventEmitter {
   static readonly VENDOR_ID = VENDOR_ID;
@@ -140,6 +164,7 @@ export class UlanziD200 extends EventEmitter {
 
   private device: HID.HID;
   private _connected = true;
+  private lastDataAt: number | null = null;
   private polling = false;
   private wasPolling = false;
   private animationTimers = new Map<number, { stop: () => void }>();
@@ -161,6 +186,7 @@ export class UlanziD200 extends EventEmitter {
     reconnectDelayMs: 2000,
     maxAttempts: 0,
     restoreState: true,
+    verifyMs: 0,
   };
   private reconnecting = false;
   private reconnectAbort: (() => void) | null = null;
@@ -170,6 +196,16 @@ export class UlanziD200 extends EventEmitter {
   /** True when the HID device is open and usable */
   get connected(): boolean {
     return this._connected;
+  }
+
+  /**
+   * Age in ms of the last packet received from the device, or null if it
+   * has never sent anything. A healthy D200 reports the info window a few
+   * times a second, so an age above a couple of seconds means the link is
+   * wedged even though the handle still looks open.
+   */
+  get lastInboundAgeMs(): number | null {
+    return this.lastDataAt == null ? null : Date.now() - this.lastDataAt;
   }
 
   constructor(device: HID.HID, reconnectOpts?: ReconnectOptions) {
@@ -204,19 +240,25 @@ export class UlanziD200 extends EventEmitter {
   ): Promise<UlanziD200> {
     const timeoutMs = options?.timeoutMs ?? 30_000;
     const intervalMs = options?.intervalMs ?? 1_000;
+    const verifyMs = options?.verifyMs ?? 0;
 
     const deadline = Date.now() + timeoutMs;
     let lastError: Error | undefined;
+    let attempt = 0;
 
     while (Date.now() < deadline) {
+      attempt++;
       try {
-        const hid = UlanziD200.openHID();
-        dbg('hid', 'openWithRetry: connected');
+        const hid = verifyMs > 0
+          ? await UlanziD200.openHIDVerified(verifyMs)
+          : UlanziD200.openHID();
+        info('hid', `openWithRetry: connected on attempt ${attempt}`);
         return new UlanziD200(hid, options);
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
-        dbg('hid', `openWithRetry: ${lastError.message}, retrying in ${intervalMs}ms`);
-        await sleep(Math.min(intervalMs, deadline - Date.now()));
+        info('hid', `openWithRetry: attempt ${attempt} failed: ${lastError.message}`);
+        const wait = Math.min(intervalMs, deadline - Date.now());
+        if (wait > 0) await sleep(wait);
       }
     }
 
@@ -224,41 +266,186 @@ export class UlanziD200 extends EventEmitter {
   }
 
   /**
+   * Candidate HID interfaces that could be a D200, widening the match
+   * when the exact VID/PID pair isn't present.
+   *
+   * A firmware hiccup or a half-finished re-enumeration can leave the
+   * device on the expected VID with a different PID (or with no product
+   * strings at all). Matching only on the exact pair then reports
+   * "not found" while the device is sitting right there in the inventory.
+   */
+  private static candidateDevices(): { list: HID.Device[]; how: string } {
+    const all = HID.devices();
+
+    const exact = all.filter(
+      (d) => d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID,
+    );
+    if (exact.length) return { list: exact, how: 'exact VID+PID' };
+
+    const sameVendor = all.filter((d) => d.vendorId === VENDOR_ID);
+    if (sameVendor.length) {
+      return { list: sameVendor, how: `VID ${hex(VENDOR_ID)} with unexpected PID` };
+    }
+
+    const byName = all.filter((d) =>
+      /ulanzi|d200/i.test(`${d.manufacturer ?? ''} ${d.product ?? ''}`),
+    );
+    if (byName.length) return { list: byName, how: 'manufacturer/product name' };
+
+    return { list: [], how: 'no match' };
+  }
+
+  /** One line per connected HID device — first thing to check when open fails. */
+  static describeDevices(): string {
+    try {
+      const all = HID.devices();
+      if (!all.length) {
+        return '  (no HID devices visible at all — check /dev/hidraw*, udev rules, container USB access)';
+      }
+      return all.map((d) => `  ${describeDevice(d)}`).join('\n');
+    } catch (err) {
+      return `  (HID.devices() failed: ${err instanceof Error ? err.message : String(err)})`;
+    }
+  }
+
+  /**
    * Low-level: open and return the raw HID device handle.
    */
   private static openHID(): HID.HID {
-    const allMatching = HID.devices().filter(
-      (d) => d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID,
-    );
+    const { list, how } = UlanziD200.candidateDevices();
 
-    if (allMatching.length === 0) {
+    if (list.length === 0) {
       throw new Error(
-        `Ulanzi D200 not found (VID: ${VENDOR_ID.toString(16)}, PID: ${PRODUCT_ID.toString(16)}). ` +
+        `Ulanzi D200 not found (VID: ${hex(VENDOR_ID)}, PID: ${hex(PRODUCT_ID)}) ` +
+        `among ${HID.devices().length} HID device(s). ` +
         'Is the device connected? On Linux, check udev rules.',
       );
     }
 
-    for (const d of allMatching) {
-      dbg('hid', `found interface=${d.interface} usage=${d.usage} usagePage=${d.usagePage} path=${d.path}`);
+    if (how !== 'exact VID+PID') {
+      info('hid', `exact VID/PID absent — falling back to match by ${how}`);
     }
 
-    // The D200 exposes multiple HID interfaces. We need the consumer
-    // control interface (interface 0), not the keyboard interface (1).
-    // Try each matching device until one opens successfully.
-    const sorted = [...allMatching].sort((a, b) => (a.interface ?? 99) - (b.interface ?? 99));
+    const failures: string[] = [];
 
-    for (const deviceInfo of sorted) {
+    for (const deviceInfo of UlanziD200.sortCandidates(list)) {
+      dbg('hid', `trying: ${describeDevice(deviceInfo)}`);
       try {
-        dbg('hid', `trying: interface=${deviceInfo.interface} usagePage=${deviceInfo.usagePage} path=${deviceInfo.path}`);
         const hid = new HID.HID(deviceInfo.path!);
-        dbg('hid', `opened successfully`);
+        info('hid', `opened ${describeDevice(deviceInfo)}`);
         return hid;
       } catch (err) {
-        dbg('hid', `failed: ${err}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        failures.push(`${describeDevice(deviceInfo)}: ${msg}`);
+        info('hid', `failed to open ${describeDevice(deviceInfo)}: ${msg}`);
       }
     }
 
-    throw new Error('Ulanzi D200 found but could not open any HID interface');
+    throw new Error(
+      `Ulanzi D200 found (${list.length} interface(s), matched by ${how}) ` +
+      `but no interface could be opened:\n  ${failures.join('\n  ')}`,
+    );
+  }
+
+  /**
+   * Open the device and confirm the interface actually talks back.
+   *
+   * The D200 exposes several HID interfaces and the usable one is not
+   * always the lowest-numbered, so a plain open can land on an interface
+   * that silently swallows every write — the process then looks alive
+   * while the screen never updates. The info window streams status
+   * packets several times a second, so any inbound traffic proves the
+   * interface is the right one. If nothing answers on any interface we
+   * still return the first one that opened: a silent handle plus a loud
+   * log line beats refusing to start.
+   */
+  private static async openHIDVerified(verifyMs: number): Promise<HID.HID> {
+    const { list, how } = UlanziD200.candidateDevices();
+
+    // No candidates at all — reuse openHID's error (with inventory dump)
+    if (list.length === 0) return UlanziD200.openHID();
+
+    if (how !== 'exact VID+PID') {
+      info('hid', `exact VID/PID absent — falling back to match by ${how}`);
+    }
+
+    let fallback: { hid: HID.HID; label: string } | null = null;
+    const failures: string[] = [];
+
+    for (const deviceInfo of UlanziD200.sortCandidates(list)) {
+      const label = describeDevice(deviceInfo);
+      let hid: HID.HID;
+      try {
+        hid = new HID.HID(deviceInfo.path!);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failures.push(`${label}: ${msg}`);
+        info('hid', `failed to open ${label}: ${msg}`);
+        continue;
+      }
+
+      if (await UlanziD200.probeTraffic(hid, verifyMs)) {
+        info('hid', `verified ${label} — device is sending data`);
+        return hid;
+      }
+
+      info('hid', `${label} opened but sent nothing in ${verifyMs}ms`);
+      if (fallback) {
+        try { hid.close(); } catch { /* ignore */ }
+      } else {
+        fallback = { hid, label };
+      }
+    }
+
+    if (fallback) {
+      info('hid', `no interface answered within ${verifyMs}ms — using ${fallback.label} anyway`);
+      return fallback.hid;
+    }
+
+    throw new Error(
+      `Ulanzi D200 found (${list.length} interface(s), matched by ${how}) ` +
+      `but no interface could be opened:\n  ${failures.join('\n  ')}`,
+    );
+  }
+
+  /**
+   * Resolve to true as soon as the device sends anything, false on
+   * timeout or read error. Leaves the handle paused either way so
+   * startPolling() can attach its own listeners later.
+   */
+  private static probeTraffic(hid: HID.HID, ms: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        hid.removeAllListeners('data');
+        hid.removeAllListeners('error');
+        // pause() interrupts the in-flight read, which node-hid reports as
+        // an 'error' — with no listener left that would take down the
+        // process, so swallow it explicitly.
+        hid.on('error', (err: Error) => info('hid', `probe: ignoring ${err.message}`));
+        try { hid.pause(); } catch { /* already closed */ }
+        resolve(ok);
+      };
+
+      const timer = setTimeout(() => finish(false), ms);
+      hid.on('data', () => finish(true));
+      hid.on('error', (err: Error) => {
+        info('hid', `probe read error: ${err.message}`);
+        finish(false);
+      });
+    });
+  }
+
+  /**
+   * Interface 0 is the control interface on healthy firmware, so try it
+   * first — but every candidate gets tried in turn.
+   */
+  private static sortCandidates(list: HID.Device[]): HID.Device[] {
+    return [...list].sort((a, b) => (a.interface ?? 99) - (b.interface ?? 99));
   }
 
   /**
@@ -309,6 +496,7 @@ export class UlanziD200 extends EventEmitter {
    */
   private handleData(buf: Buffer): void {
     try {
+      this.lastDataAt = Date.now();
       dbgVerbose('recv', `raw ${hexDump(buf, 16)}`);
 
       const parsed = parsePacket(buf);
@@ -649,7 +837,7 @@ export class UlanziD200 extends EventEmitter {
 
     // HID read errors on a disconnected device are the primary signal.
     // node-hid throws "could not read from HID device" or similar.
-    dbg('hid', `device error: ${err.message}`);
+    info('hid', `device error: ${err.message} — treating as disconnect`);
     this._connected = false;
     this.wasPolling = this.polling;
 
@@ -687,10 +875,12 @@ export class UlanziD200 extends EventEmitter {
 
       while (!cancelled) {
         tries++;
-        dbg('reconnect', `attempt ${tries}${maxAttempts > 0 ? `/${maxAttempts}` : ''}`);
+        info('reconnect', `attempt ${tries}${maxAttempts > 0 ? `/${maxAttempts}` : ''}`);
 
         try {
-          const hid = UlanziD200.openHID();
+          const hid = this.reconnectOpts.verifyMs > 0
+            ? await UlanziD200.openHIDVerified(this.reconnectOpts.verifyMs)
+            : UlanziD200.openHID();
 
           // Give the freshly enumerated device time to finish internal
           // init before using it — writing too early can fail or leave
@@ -709,7 +899,7 @@ export class UlanziD200 extends EventEmitter {
           this.reconnecting = false;
           this.reconnectAbort = null;
 
-          dbg('reconnect', 'connected');
+          info('reconnect', `connected after ${tries} attempt(s)`);
 
           // Re-attach polling if it was active before disconnect
           if (this.wasPolling) {
@@ -726,11 +916,11 @@ export class UlanziD200 extends EventEmitter {
           return;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          dbg('reconnect', `failed: ${msg}`);
+          info('reconnect', `failed: ${msg}`);
         }
 
         if (maxAttempts > 0 && tries >= maxAttempts) {
-          dbg('reconnect', `gave up after ${tries} attempts`);
+          info('reconnect', `gave up after ${tries} attempts`);
           this.reconnecting = false;
           this.reconnectAbort = null;
           return;
@@ -922,8 +1112,13 @@ export class UlanziD200 extends EventEmitter {
     dbgVerbose('send', `  pkt[0] header: ${hexDump(packets[0], 16)}`);
 
     // Tight synchronous write loop — no yielding between packets
+    const started = Date.now();
     for (const pkt of packets) {
       this.writeRaw(pkt);
+    }
+    const took = Date.now() - started;
+    if (took > SLOW_WRITE_MS) {
+      info('send', `${label}: ${packets.length} packets took ${took}ms — device is slow to accept writes`);
     }
 
     // Let the device decompress the ZIP and render before we send anything else
